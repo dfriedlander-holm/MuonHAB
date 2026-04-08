@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Atmospheric Muon Sim: v1.1</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.4.0/p5.js"></script>
+    <style>
+        body { margin: 0; display: flex; font-family: sans-serif; background: #1a1a1a; color: white; overflow: hidden; }
+        #controls { width: 320px; height: 100vh; padding: 20px; background: #2c2c2c; overflow-y: auto; border-right: 2px solid #444; box-sizing: border-box; }
+        #simulation-container { flex-grow: 1; position: relative; }
+        .slider-group { margin-bottom: 15px; }
+        label { display: block; font-size: 0.8em; margin-bottom: 5px; color: #aaa; }
+        input[type="range"] { width: 100%; }
+        .readout { font-family: monospace; color: #00ff00; float: right; }
+        button { width: 100%; padding: 10px; margin: 5px 0; cursor: pointer; background: #444; color: white; border: none; border-radius: 4px; }
+        button:hover { background: #666; }
+        .toggle-container { display: flex; justify-content: space-between; margin: 10px 0; font-size: 0.9em; }
+        h2 { margin-top: 0; color: #5bc0de; }
+        .legend { font-size: 0.8em; background: rgba(0,0,0,0.5); padding: 10px; border-radius: 5px; margin-top: 10px; }
+        hr { border: 0; border-top: 1px solid #444; margin: 15px 0; }
+    </style>
+</head>
+<body>
+
+<div id="controls">
+    <h2>HAB Muon Sim</h2>
+
+    <div class="slider-group">
+        <label>Primary Flux (Solar) <span id="flux-val" class="readout">30</span></label>
+        <input type="range" id="flux-slider" min="1" max="100" value="30">
+    </div>
+
+    <div class="slider-group">
+        <label>Balloon Altitude (ft) <span id="alt-val" class="readout">0</span></label>
+        <input type="range" id="alt-slider" min="0" max="120000" value="0" step="500">
+    </div>
+
+    <div class="slider-group">
+        <label>Detector Area (cm²) <span id="area-val" class="readout">100</span></label>
+        <input type="range" id="area-slider" min="10" max="500" value="100">
+    </div>
+
+    <div class="slider-group">
+        <label>Efficiency (%) <span id="eff-val" class="readout">80</span></label>
+        <input type="range" id="eff-slider" min="1" max="100" value="80">
+    </div>
+
+    <div class="slider-group">
+        <label>Simulation Speed <span id="speed-val" class="readout">1x</span></label>
+        <input type="range" id="speed-slider" min="0.1" max="5" value="1" step="0.1">
+    </div>
+
+    <hr>
+
+    <div class="toggle-container">
+        <span>Chain Mode:</span>
+        <select id="mode-select">
+            <option value="simple">Simple (p+ -> μ)</option>
+            <option value="realistic">Realistic (p+ -> π -> μ)</option>
+        </select>
+    </div>
+
+    <div class="toggle-container">
+        <span>Relativity:</span>
+        <input type="checkbox" id="relativity-check" checked>
+    </div>
+
+    <div class="toggle-container">
+        <span>Geiger Clicks:</span>
+        <input type="checkbox" id="audio-check">
+    </div>
+
+    <button id="pause-btn">Pause Simulation</button>
+    <button id="reset-btn">Reset Counters</button>
+    <button id="export-btn" style="background: #286090;">Export Flight Data (CSV)</button>
+
+    <div class="legend">
+        <strong>Particles:</strong><br>
+        p+ : Cosmic Ray Proton<br>
+        π : Pion (Short-lived)<br>
+        μ : Muon (Detected)
+    </div>
+</div>
+
+<div id="simulation-container"></div>
+
+<script>
+let particles = [];
+let balloonY;
+let altitudeFt = 0;
+let prevAltitudeFt = 0;
+let fluxCount = 0;
+let dataLog = [];
+let isPaused = false;
+let osc;
+let atmBuffer; // cached atmosphere gradient — redrawn only on resize
+let audioResumed = false;
+
+// Rolling rate: timestamps of hits in the last 10 seconds
+let recentHits = [];
+
+// Simulation state — updated by event listeners, not polled every frame
+let simState = {
+    flux:       30,
+    altitudeFt: 0,
+    area:       100,
+    eff:        80,
+    speed:      1.0,
+    relativity: true,
+    mode:       'simple',
+    audio:      false
+};
+
+// Constants
+const MUON_LIFE    = 120;
+const PION_LIFE    = 15;
+const PFOTZER_ALT  = 60000; // ft
+// Real muons at ~3 GeV have a Lorentz factor of ~28; we use 15 as an
+// accessible educational approximation of relativistic time dilation.
+const LORENTZ_FACTOR = 15;
+
+// Live histogram: detections bucketed by altitude (one bucket per 5 000 ft)
+const ALT_BUCKETS = 24;
+let altHistogram = new Array(ALT_BUCKETS).fill(0);
+
+// ── Setup ──────────────────────────────────────────────────────────────────
+
+function setup() {
+    let canvas = createCanvas(windowWidth - 320, windowHeight);
+    canvas.parent('simulation-container');
+    osc = new p5.Oscillator('square');
+    osc.amp(0);
+    osc.start();
+    textFont('monospace');
+
+    // Pre-render the static atmosphere gradient once
+    atmBuffer = createGraphics(windowWidth - 320, windowHeight);
+    drawAtmosphereToBuffer();
+
+    setupEventListeners();
+}
+
+function setupEventListeners() {
+    select('#flux-slider').input(() => {
+        simState.flux = parseInt(select('#flux-slider').value());
+        select('#flux-val').html(simState.flux);
+    });
+
+    select('#alt-slider').input(() => {
+        simState.altitudeFt = parseInt(select('#alt-slider').value());
+        select('#alt-val').html(simState.altitudeFt);
+        // Reset session counters when altitude changes by more than 2 500 ft
+        // so the rate readout reflects the current altitude, not a blend.
+        if (Math.abs(simState.altitudeFt - prevAltitudeFt) > 2500) {
+            resetCounters();
+            prevAltitudeFt = simState.altitudeFt;
+        }
+    });
+
+    select('#area-slider').input(() => {
+        simState.area = parseInt(select('#area-slider').value());
+        select('#area-val').html(simState.area);
+    });
+
+    select('#eff-slider').input(() => {
+        simState.eff = parseInt(select('#eff-slider').value());
+        select('#eff-val').html(simState.eff);
+    });
+
+    select('#speed-slider').input(() => {
+        simState.speed = parseFloat(select('#speed-slider').value());
+        select('#speed-val').html(simState.speed + "x");
+    });
+
+    select('#relativity-check').changed(() => {
+        simState.relativity = select('#relativity-check').checked();
+    });
+
+    select('#mode-select').changed(() => {
+        simState.mode = select('#mode-select').value();
+    });
+
+    select('#audio-check').changed(() => {
+        simState.audio = select('#audio-check').checked();
+        // Web Audio API requires a resumed AudioContext after user gesture.
+        if (simState.audio && !audioResumed) {
+            getAudioContext().resume().then(() => { audioResumed = true; });
+        }
+    });
+}
+
+function resetCounters() {
+    fluxCount = 0;
+    recentHits = [];
+    // dataLog keeps the full flight history across altitude changes
+}
+
+// ── Main loop ──────────────────────────────────────────────────────────────
+
+function draw() {
+    if (isPaused) return;
+
+    // Blit the pre-rendered atmosphere (O(1) instead of O(height) per frame)
+    image(atmBuffer, 0, 0);
+
+    altitudeFt = simState.altitudeFt;
+    balloonY = map(altitudeFt, 0, 120000, height - 50, 50);
+
+    drawBalloon(balloonY, simState.area);
+
+    // Spawn rate: interval in frames, linear in flux.
+    // flux=1  -> every 200 frames  (sparse)
+    // flux=50 -> every 4 frames
+    // flux=100 -> every 2 frames   (dense)
+    let spawnInterval = max(2, floor(200 / simState.flux));
+    if (frameCount % spawnInterval === 0) {
+        particles.push(new Particle('proton', random(width), -20));
+    }
+
+    for (let i = particles.length - 1; i >= 0; i--) {
+        let p = particles[i];
+        p.update(simState.speed, simState.relativity);
+        p.display();
+
+        // Proton hits its pre-assigned interaction altitude → convert
+        if (p.type === 'proton' && p.y > p.interactY) {
+            particles.push(new Particle(
+                simState.mode === 'realistic' ? 'pion' : 'muon',
+                p.x, p.y
+            ));
+            particles.splice(i, 1);
+            continue;
+        }
+
+        // Pion decay → muon
+        if (p.type === 'pion' && p.life <= 0) {
+            particles.push(new Particle('muon', p.x, p.y));
+            particles.splice(i, 1);
+            continue;
+        }
+
+        // Detector hit
+        let detW = map(simState.area, 10, 500, 20, 100);
+        if (p.type === 'muon' && !p.detected &&
+            p.y > balloonY - 10 && p.y < balloonY + 10 &&
+            p.x > (width/2 - detW/2) && p.x < (width/2 + detW/2)) {
+
+            if (random(100) < simState.eff) {
+                p.detected = true;
+                fluxCount++;
+                let now = millis();
+                recentHits.push(now);
+                if (simState.audio) clickSound();
+
+                // Cap log at 10 000 entries to prevent unbounded growth
+                if (dataLog.length < 10000) {
+                    dataLog.push({ alt: altitudeFt, time: Math.floor(now) });
+                }
+
+                // Update live histogram
+                let bucket = constrain(
+                    floor(altitudeFt / (120000 / ALT_BUCKETS)),
+                    0, ALT_BUCKETS - 1
+                );
+                altHistogram[bucket]++;
+            }
+        }
+
+        // Remove particles that are off-screen or have fully decayed
+        if (p.y > height || p.life <= 0) {
+            particles.splice(i, 1);
+        }
+    }
+
+    // Prune hits older than 10 s for the rolling rate readout
+    let nowMs = millis();
+    recentHits = recentHits.filter(t => nowMs - t < 10000);
+
+    drawGraph();
+    drawLabels();
+    drawVersion();
+}
+
+// ── Particle class ─────────────────────────────────────────────────────────
+
+class Particle {
+    constructor(type, x, y) {
+        this.type     = type;
+        this.x        = x;
+        this.y        = y;
+        this.life     = type === 'muon' ? MUON_LIFE : PION_LIFE;
+        this.detected = false;
+        this.vel      = type === 'proton' ? 6 : 10;
+
+        // Assign interaction altitude once at construction (±5 000 ft jitter).
+        // Previous code recomputed this every frame with wider ±15 000 ft noise,
+        // causing non-deterministic, stuttery conversions.
+        let interactAlt = PFOTZER_ALT + random(-5000, 5000);
+        this.interactY  = map(interactAlt, 0, 120000, height, 0);
+    }
+
+    update(speed, relativity) {
+        let decayRate = speed;
+        if (this.type === 'muon' && relativity) {
+            // Relativistic time dilation slows muon decay by LORENTZ_FACTOR (~15×).
+            // Real atmospheric muons at ~3 GeV have γ ≈ 28; this is a simplified
+            // but physically motivated approximation for educational purposes.
+            decayRate = speed / LORENTZ_FACTOR;
+        }
+        this.y    += this.vel * speed;
+        this.life -= decayRate;
+    }
+
+    display() {
+        noStroke();
+        textSize(14);
+        if (this.type === 'proton') {
+            fill(255, 100, 100);
+            text("p+", this.x, this.y);
+        } else if (this.type === 'pion') {
+            fill(100, 255, 100);
+            text("π", this.x, this.y);
+        } else {
+            fill(this.detected ? "#00ff00" : "#5bc0de");
+            text("μ", this.x, this.y);
+        }
+    }
+}
+
+// ── Drawing helpers ────────────────────────────────────────────────────────
+
+function drawAtmosphereToBuffer() {
+    for (let i = 0; i < atmBuffer.height; i++) {
+        let inter = map(i, 0, atmBuffer.height, 0, 1);
+        let c = lerpColor(color(5, 5, 15), color(100, 180, 255), inter);
+        atmBuffer.stroke(c);
+        atmBuffer.line(0, i, atmBuffer.width, i);
+    }
+    atmBuffer.stroke(255, 30);
+    atmBuffer.line(0, atmBuffer.height * 0.7, atmBuffer.width, atmBuffer.height * 0.7);
+    atmBuffer.fill(255, 80);
+    atmBuffer.noStroke();
+    atmBuffer.textSize(10);
+    atmBuffer.textFont('monospace');
+    atmBuffer.text("TROPOSPHERE",  10, atmBuffer.height - 35);
+    atmBuffer.text("STRATOSPHERE", 10, atmBuffer.height * 0.5);
+}
+
+function drawBalloon(y, area) {
+    let size = map(area, 10, 500, 35, 90);
+    fill(255, 230);
+    noStroke();
+    rectMode(CORNER); // reset before ellipse/rect calls
+    ellipse(width/2, y - 45, size, size * 1.25);
+    stroke(255, 150);
+    line(width/2, y - 45 + (size * 1.25) / 2, width/2, y);
+    fill(220, 50, 50);
+    noStroke();
+    rectMode(CENTER);
+    rect(width/2, y, size / 2.5, 12);
+    rectMode(CORNER); // always restore after CENTER use
+}
+
+function drawLabels() {
+    let temp  = altitudeFt < 36000 ? (59 - 0.00356 * altitudeFt).toFixed(1) : -67;
+    let press = (1013 * Math.exp(-altitudeFt / 23000)).toFixed(1);
+    let rate  = (recentHits.length / 10).toFixed(1); // hits over last 10 s → /s
+
+    textAlign(LEFT);
+    fill(0, 255, 0);
+    textSize(14);
+    text(`Temp: ${temp}°F`,    width - 185, 30);
+    text(`Press: ${press} hPa`, width - 185, 50);
+    text(`Hits: ${fluxCount}`,  width - 185, 70);
+    text(`Rate: ${rate} /s`,    width - 185, 90);
+
+    if (dataLog.length >= 10000) {
+        fill(255, 180, 0);
+        text("Log full (10k)", width - 185, 110);
+    }
+}
+
+function drawGraph() {
+    push();
+    rectMode(CORNER); // guard against any leftover CENTER mode
+
+    let gx = 20, gy = height - 175, gw = 150, gh = 130;
+
+    // Background panel
+    fill(0, 0, 0, 160);
+    noStroke();
+    rect(gx, gy, gw, gh);
+
+    // Title
+    fill(255, 180);
+    noStroke();
+    textSize(9);
+    textAlign(LEFT);
+    text("Detections by Altitude", gx + 3, gy - 3);
+
+    let maxVal = max(altHistogram) || 1;
+    let barW   = gw / ALT_BUCKETS;
+    let plotH  = gh - 20; // leave 20px for axis labels
+
+    // Live histogram bars
+    for (let i = 0; i < ALT_BUCKETS; i++) {
+        let barH   = map(altHistogram[i], 0, maxVal, 0, plotH);
+        let altMid = (i + 0.5) * (120000 / ALT_BUCKETS);
+        // Colour peaks near Pfotzer maximum (~60 k ft, bucket 12)
+        let t = abs(altMid - 55000) / 60000;
+        fill(lerpColor(color(0, 220, 100), color(0, 80, 200), min(t * 2, 1)));
+        noStroke();
+        rect(gx + i * barW, gy + plotH - barH, barW - 1, barH);
+    }
+
+    // Pfotzer reference curve overlay (orange dashed)
+    stroke(255, 130, 0, 180);
+    noFill();
+    beginShape();
+    for (let i = 0; i < ALT_BUCKETS; i++) {
+        let altMid = (i + 0.5) * (120000 / ALT_BUCKETS);
+        let f      = exp(-pow(altMid - 55000, 2) / (2 * pow(25000, 2)));
+        vertex(gx + (i + 0.5) * barW, gy + plotH - f * plotH);
+    }
+    endShape();
+
+    // Axis labels
+    noStroke();
+    fill(200, 200, 200, 180);
+    textSize(8);
+    textAlign(LEFT);
+    text("0",    gx + 1,      gy + gh - 2);
+    textAlign(RIGHT);
+    text("120k", gx + gw - 1, gy + gh - 2);
+    textAlign(CENTER);
+    text("alt (ft)", gx + gw / 2, gy + gh - 2);
+
+    // Legend
+    stroke(255, 130, 0, 180);
+    line(gx + 3, gy + gh - 11, gx + 13, gy + gh - 11);
+    noStroke();
+    fill(255, 130, 0, 200);
+    textAlign(LEFT);
+    text("Pfotzer ref", gx + 15, gy + gh - 8);
+
+    pop();
+}
+
+function drawVersion() {
+    fill(255, 60);
+    noStroke();
+    textSize(12);
+    textAlign(LEFT);
+    text("v1.1", 10, height - 10);
+}
+
+// ── Audio ──────────────────────────────────────────────────────────────────
+
+function clickSound() {
+    osc.amp(0.2, 0.01);
+    setTimeout(() => osc.amp(0, 0.05), 15);
+}
+
+// ── Button handlers ────────────────────────────────────────────────────────
+
+select('#pause-btn').mousePressed(() => {
+    isPaused = !isPaused;
+    select('#pause-btn').html(isPaused ? "Resume" : "Pause");
+});
+
+select('#reset-btn').mousePressed(() => {
+    resetCounters();
+    altHistogram = new Array(ALT_BUCKETS).fill(0);
+});
+
+select('#export-btn').mousePressed(() => {
+    let csv = "Altitude_ft,Timestamp_ms\n";
+    dataLog.forEach(row => { csv += `${row.alt},${row.time}\n`; });
+    let blob = new Blob([csv], { type: 'text/csv' });
+    let url  = window.URL.createObjectURL(blob);
+    let a    = document.createElement('a');
+    a.href     = url;
+    a.download = 'muon_data_v1.1.csv';
+    a.click();
+});
+
+// ── Resize ─────────────────────────────────────────────────────────────────
+
+function windowResized() {
+    resizeCanvas(windowWidth - 320, windowHeight);
+    atmBuffer = createGraphics(windowWidth - 320, windowHeight);
+    drawAtmosphereToBuffer();
+}
+</script>
+</body>
+</html>
